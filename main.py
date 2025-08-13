@@ -171,8 +171,8 @@ class HyperliquidTrader:
             logger.error(f"Error getting market price for {symbol}: {e}")
             return None
         
-    def place_order(self, symbol, is_buy, size, price, order_type="limit"):
-        """Place an order on Hyperliquid"""
+    def place_order(self, symbol, is_buy, size, price, order_type="limit", leverage=2.0):
+        """Place an order on Hyperliquid with specified leverage"""
         try:
             # Get proper market price for market orders
             if order_type == "market":
@@ -193,7 +193,7 @@ class HyperliquidTrader:
             if size != original_size:
                 logger.info(f"Size adjusted from {original_size:.8f} to {size:.8f} for {symbol}")
             
-            logger.info(f"Placing order: {symbol}, is_buy={is_buy}, size={size}, price={price}")
+            logger.info(f"Placing order: {symbol}, is_buy={is_buy}, size={size}, price={price}, leverage={leverage}x")
             
             # Choose order type
             if order_type == "market":
@@ -203,6 +203,14 @@ class HyperliquidTrader:
                 # Use GTC (Good Till Cancel) for limit orders
                 order_type_param = {"limit": {"tif": "Gtc"}}
             
+            # Calculate required margin for the desired leverage
+            position_notional = size * price
+            required_margin = position_notional / leverage
+            
+            logger.info(f"Position notional: ${position_notional:.2f}, Required margin for {leverage}x leverage: ${required_margin:.2f}")
+            
+            # For Hyperliquid, leverage is achieved through position sizing
+            # The exchange will use cross margin by default unless isolated is specified
             order_result = self.exchange.order(
                 symbol, 
                 is_buy, 
@@ -314,38 +322,43 @@ class HyperliquidTrader:
             logger.error(f"Error getting vault balance: {e}")
             return None
     
-    def calculate_position_size(self, symbol, current_price, percentage=10.0):
-        """Calculate position size based on percentage of vault balance"""
+    def calculate_position_size(self, symbol, current_price, percentage=10.0, leverage=2.0):
+        """Calculate position size based on percentage of vault balance with leverage"""
         try:
             vault_info = self.get_vault_balance()
             if not vault_info:
                 logger.warning("Could not get vault balance, using default $100")
-                fallback_size = 100.0 / current_price
-                return 100.0, fallback_size
+                fallback_margin = 100.0
+                fallback_size = (fallback_margin * leverage) / current_price
+                return fallback_margin * leverage, fallback_size
             
-            # Use percentage of total account value
+            # Use percentage of total account value as margin allocation
             total_value = vault_info['total_account_value']
-            position_size_usd = total_value * (percentage / 100.0)
+            margin_allocation_usd = total_value * (percentage / 100.0)
+            
+            # Calculate position size using leverage
+            # Position size = margin * leverage / price
+            position_size_usd = margin_allocation_usd * leverage
+            position_size = position_size_usd / current_price
             
             # Calculate minimum position size for this asset
             min_order_size = self.get_min_order_size(symbol, current_price)
             min_position_usd = min_order_size * current_price
             logger.info(f"Min position size for {symbol}: ${min_position_usd:.2f}")
-            logger.info(f"Position size for {symbol}: ${position_size_usd:.2f}")
+            logger.info(f"Position size for {symbol} with {leverage}x leverage: ${position_size_usd:.2f}")
             
             # Ensure position size meets minimum requirements
             if position_size_usd < min_position_usd:
                 logger.warning(f"Calculated position size ${position_size_usd:.2f} below minimum ${min_position_usd:.2f} for {symbol}")
                 position_size_usd = min_position_usd * 1.1  # Add 10% buffer above minimum
+                position_size = position_size_usd / current_price
                 logger.info(f"Adjusted position size to ${position_size_usd:.2f}")
-            
-            position_size = position_size_usd / current_price
             
             # Final validation and adjustment
             position_size = self.validate_and_adjust_size(symbol, position_size, current_price)
             position_size_usd = position_size * current_price
             
-            logger.info(f"Vault total value: ${total_value:.2f}, using {percentage}% = ${position_size_usd:.2f} = {position_size:.8f} {symbol}")
+            logger.info(f"Vault total value: ${total_value:.2f}, using {percentage}% margin (${margin_allocation_usd:.2f}) with {leverage}x leverage = ${position_size_usd:.2f} = {position_size:.8f} {symbol}")
             
             return position_size_usd, position_size
             
@@ -353,8 +366,10 @@ class HyperliquidTrader:
             logger.error(f"Error calculating position size: {e}")
             # Fallback to safe default
             min_size = self.get_min_order_size(symbol, current_price) if symbol else 0.001
-            fallback_usd = min_size * current_price if min_size else 100.0
-            return fallback_usd, min_size
+            fallback_margin = 100.0
+            fallback_position_usd = fallback_margin * leverage if leverage else 100.0
+            fallback_size = fallback_position_usd / current_price if current_price else min_size
+            return fallback_position_usd, fallback_size
 
     def close_position(self, symbol):
         """Close a position without enforcing minimum size"""
@@ -600,20 +615,21 @@ def receive_signal():
                 if symbol in active_positions:
                     del active_positions[symbol]
         
-        # Calculate position size based on vault balance (10% by default)
+        # Calculate position size based on vault balance (10% by default) with 2x leverage
         try:
             risk_percentage = float(os.getenv('VAULT_RISK_PERCENTAGE', '10.0'))
-            logger.info(f"Risk percentage: {risk_percentage}")
-            position_size_usd, position_size = trader.calculate_position_size(symbol, current_price, risk_percentage)
-            logger.info(f"Calculated position size: ${position_size_usd:.2f} = {position_size:.8f} {symbol}")
+            leverage = 2.0  # Fixed 2x leverage for all orders
+            logger.info(f"Risk percentage: {risk_percentage}, Leverage: {leverage}x")
+            position_size_usd, position_size = trader.calculate_position_size(symbol, current_price, risk_percentage, leverage)
+            logger.info(f"Calculated position size: ${position_size_usd:.2f} = {position_size:.8f} {symbol} with {leverage}x leverage")
         except Exception as e:
             logger.error(f"Error calculating position size: {e}")
             return jsonify({'error': f'Position size calculation error: {str(e)}'}), 500
         
-        # Place the order
+        # Place the order with 2x leverage
         try:
-            logger.info(f"Placing {signal_message} order for {symbol}: size={position_size}, price={current_price}")
-            order_result = trader.place_order(symbol, is_buy, position_size, current_price, "market")
+            logger.info(f"Placing {signal_message} order for {symbol}: size={position_size}, price={current_price}, leverage=2x")
+            order_result = trader.place_order(symbol, is_buy, position_size, current_price, "market", leverage=2.0)
             logger.info(f"Order result: {order_result}")
             
             if not order_result:
@@ -955,16 +971,17 @@ def get_vault_balance():
         if not vault_info:
             return jsonify({'error': 'Could not retrieve vault balance'}), 500
         
-        # Calculate position sizes for different risk percentages
+        # Calculate position sizes for different risk percentages with 2x leverage
         btc_price = trader.get_current_price('BTC')
         position_examples = {}
         
         if btc_price:
             for pct in [5, 10, 15, 20]:
-                size_usd, size_btc = trader.calculate_position_size('BTC', btc_price, pct)
+                size_usd, size_btc = trader.calculate_position_size('BTC', btc_price, pct, leverage=2.0)
                 position_examples[f'{pct}%'] = {
                     'usd': round(size_usd, 2),
-                    'btc': round(size_btc, 8)
+                    'btc': round(size_btc, 8),
+                    'leverage': '2x'
                 }
         
         return jsonify({
