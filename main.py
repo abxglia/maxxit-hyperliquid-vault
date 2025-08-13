@@ -506,10 +506,45 @@ def monitor_positions():
 
 logger.info(f"Risk percentage: {os.getenv('VAULT_RISK_PERCENTAGE')}")
 
+@app.route('/', methods=['GET'])
+def home_page():
+    """Simple home page with a welcome message and vault link"""
+    return """
+    <!doctype html>
+    <html lang="en">
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Hyperliquid Vault</title>
+        <style>
+            body { font-family: system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,sans-serif; padding: 40px; line-height: 1.5; }
+            a { color: #2563eb; text-decoration: none; }
+            a:hover { text-decoration: underline; }
+        </style>
+    </head>
+    <body>
+        <h1>Welcome to the Hyperliquid Vault API</h1>
+        <p>This service receives trading signals and manages orders on Hyperliquid.</p>
+        <p>
+            View the vault on Hyperliquid Testnet:
+            <a href="https://app.hyperliquid-testnet.xyz/vaults/0xb51423485c8fa348701f208618755b76b124a8e6" target="_blank" rel="noopener noreferrer">Open Vault</a>
+        </p>
+    </body>
+    </html>
+    """
+
 @app.route('/signal', methods=['POST'])
 def receive_signal():
     """Receive and process trading signal"""
     try:
+        # Require header-based auth for sending signals
+        expected_token = os.getenv('SIGNAL_AUTH_TOKEN')
+        if not expected_token:
+            return jsonify({'error': 'Server not configured for auth. Please set SIGNAL_AUTH_TOKEN.'}), 500
+        provided_token = request.headers.get('X-Auth-Token')
+        if not provided_token or provided_token != expected_token:
+            return jsonify({'error': 'Unauthorized: missing or invalid X-Auth-Token header'}), 401
+
         # Get and validate JSON data
         signal_data = request.get_json()
         
@@ -689,6 +724,14 @@ def receive_signal():
 def close_all_positions():
     """Close all open positions"""
     try:
+        # Require header-based auth for closing positions
+        expected_token = os.getenv('SIGNAL_AUTH_TOKEN')
+        if not expected_token:
+            return jsonify({'error': 'Server not configured for auth. Please set SIGNAL_AUTH_TOKEN.'}), 500
+        provided_token = request.headers.get('X-Auth-Token')
+        if not provided_token or provided_token != expected_token:
+            return jsonify({'error': 'Unauthorized: missing or invalid X-Auth-Token header'}), 401
+
         # Load configuration and create trader
         private_key, vault_address, testnet = load_config()
         trader = HyperliquidTrader(private_key, vault_address, testnet)
