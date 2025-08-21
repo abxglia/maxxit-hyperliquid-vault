@@ -1,2 +1,14 @@
+# Core dependencies
 flask
+python-dotenv
+
+# Hyperliquid dependencies
 hyperliquid-python-sdk
+eth-account
+
+# Database dependencies
+pymongo
+
+# Other dependencies
+requests
+typing-extensions
