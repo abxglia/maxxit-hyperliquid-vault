@@ -4,6 +4,7 @@ Position monitoring module for Hyperliquid Trading Signal API
 """
 
 import time
+import os
 import logging
 import threading
 from datetime import datetime, timezone
@@ -27,6 +28,13 @@ class PositionMonitor:
         self.monitor_thread = None
         self._last_heartbeat_time = 0.0
         self._heartbeat_interval = 60.0  # 60 seconds
+        # Trailing stop configuration and per-position state
+        try:
+            self.trail_percent = float(os.getenv('TRAIL_PERCENT', '0.02'))
+        except Exception:
+            self.trail_percent = 0.02
+        # Map signal_id -> state dict { 'tp1_hit': bool, 'peak': float, 'low': float }
+        self._trailing_states = {}
     
     def start_monitoring(self):
         """Start the monitoring thread"""
@@ -117,30 +125,65 @@ class PositionMonitor:
         
         should_close = False
         close_reason = ""
+
+        # Per-position trailing state
+        sig_id = signal.get_signal_id_str()
+        state = self._trailing_states.get(sig_id)
+        if state is None:
+            state = {'tp1_hit': False, 'peak': None, 'low': None}
+            self._trailing_states[sig_id] = state
         
         # Check price-based exit conditions
         if is_buy_signal:
-            # For buy signals, close on price reaching TP or falling to SL
-            if current_price >= tp2:
-                should_close = True
-                close_reason = f"TP2 hit: {current_price} >= {tp2}"
-            elif current_price >= tp1:
-                should_close = True
-                close_reason = f"TP1 hit: {current_price} >= {tp1}"
-            elif current_price <= sl:
+            # BUY logic with trailing stop after TP1
+            # Hard SL always active
+            if current_price <= sl:
                 should_close = True
                 close_reason = f"SL hit: {current_price} <= {sl}"
+            # If TP2 reached at any time, take profit
+            elif current_price >= tp2:
+                should_close = True
+                close_reason = f"TP2 hit: {current_price} >= {tp2}"
+            else:
+                if not state['tp1_hit']:
+                    # Arm trailing once TP1 reached
+                    if current_price >= tp1:
+                        state['tp1_hit'] = True
+                        state['peak'] = current_price
+                else:
+                    # Update peak since TP1
+                    if state['peak'] is None or current_price > state['peak']:
+                        state['peak'] = current_price
+                    # Exit on trail from peak
+                    trail_stop = state['peak'] * (1.0 - self.trail_percent)
+                    if current_price <= trail_stop:
+                        should_close = True
+                        close_reason = f"Trailing stop hit: {current_price} <= {trail_stop:.6f} (peak {state['peak']:.6f})"
         else:
-            # For sell signals, close on price falling to TP or rising to SL
-            if current_price <= tp2:
-                should_close = True
-                close_reason = f"TP2 hit: {current_price} <= {tp2}"
-            elif current_price <= tp1:
-                should_close = True
-                close_reason = f"TP1 hit: {current_price} <= {tp1}"
-            elif current_price >= sl:
+            # SELL (short) logic with trailing stop after TP1
+            # Hard SL always active
+            if current_price >= sl:
                 should_close = True
                 close_reason = f"SL hit: {current_price} >= {sl}"
+            # If TP2 reached at any time, take profit
+            elif current_price <= tp2:
+                should_close = True
+                close_reason = f"TP2 hit: {current_price} <= {tp2}"
+            else:
+                if not state['tp1_hit']:
+                    # Arm trailing once TP1 reached (downwards)
+                    if current_price <= tp1:
+                        state['tp1_hit'] = True
+                        state['low'] = current_price
+                else:
+                    # Update low since TP1
+                    if state['low'] is None or current_price < state['low']:
+                        state['low'] = current_price
+                    # Exit on trail from low (price rising by trail % from the post-TP1 low)
+                    trail_stop = state['low'] * (1.0 + self.trail_percent)
+                    if current_price >= trail_stop:
+                        should_close = True
+                        close_reason = f"Trailing stop hit: {current_price} >= {trail_stop:.6f} (low {state['low']:.6f})"
         
         # Check time-based exit condition
         if datetime.now(timezone.utc) >= max_exit_time:
@@ -154,6 +197,9 @@ class PositionMonitor:
             success = self.position_manager.close_position(signal.get_signal_id_str(), symbol)
             if success:
                 logger.info(f"Position closed successfully: {close_reason}")
+                # Clear trailing state on close
+                if sig_id in self._trailing_states:
+                    self._trailing_states.pop(sig_id, None)
             else:
                 logger.error(f"Failed to close position for {symbol}")
     
